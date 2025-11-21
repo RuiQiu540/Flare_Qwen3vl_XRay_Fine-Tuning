@@ -16,7 +16,7 @@ def load_jsonl_dataset(jsonl_path: str):
     """
     read jsonl，return Python list[dict]，each element is a sample：
     {
-      "messages": [...],  # Qwen3-VL 的 chat 格式
+      "messages": [...],
     }
     """
     data = []
