@@ -9,12 +9,12 @@ import torch
 from unsloth import FastVisionModel, is_bf16_supported
 from unsloth.trainer import UnslothVisionDataCollator
 from trl import SFTTrainer, SFTConfig
-from transformers import EarlyStoppingCallback  # ★ 新增：用于 patience 早停
+from transformers import EarlyStoppingCallback
 
 
 def load_jsonl_dataset(jsonl_path: str):
     """
-    直接读 jsonl，返回 Python list[dict]，每个元素是一条样本：
+    read jsonl，return Python list[dict]，each element is a sample：
     {
       "messages": [...],  # Qwen3-VL 的 chat 格式
     }
@@ -31,7 +31,7 @@ def load_jsonl_dataset(jsonl_path: str):
             try:
                 data.append(json.loads(line))
             except Exception as e:
-                print(f"[warn] 解析 {jsonl_path} 第 {n_total} 行失败, 跳过: {e}")
+                print(f"[warn] analyze {jsonl_path} line {n_total} fail, skip: {e}")
                 n_bad += 1
 
     print(f"[data] loaded {len(data)} samples from {jsonl_path}, bad lines = {n_bad}")
@@ -55,26 +55,26 @@ def main():
         "--image_root",
         type=str,
         default="/home/ruiqiu/scratch/FLARE_Task5",
-        help="目前暂时不用这个参数，图像路径已经写在 messages 里，由 Unsloth 自己处理。",
+        help="dont need this parameter，image path is within messages，Unsloth will do",
     )
     parser.add_argument(
         "--wandb_project",
         type=str,
         default="flare_task5_sft",
-        help="wandb 项目名称，用于收集本次 SFT 训练曲线。",
+        help="wandb project name",
     )
     parser.add_argument(
         "--wandb_run_name",
         type=str,
         default="qwen3vl_sft_debug",
-        help="wandb run 的名字，方便区分不同实验。",
+        help="wandb run name",
     )
     parser.add_argument(
         "--report_to",
         type=str,
         default="wandb",
         choices=["none", "wandb"],
-        help="是否把日志上报到 wandb。",
+        help="opload to wandb or not",
     )
     parser.add_argument(
         "--output_dir",
@@ -85,26 +85,25 @@ def main():
         "--model_name",
         type=str,
         default="unsloth/Qwen3-VL-4B-Instruct",
-        help="避免 4bit/bnb 依赖，先用全精度 + LoRA。",
+        help="avoid 4bit/bnb depencency，full precision + LoRA",
     )
     parser.add_argument("--max_seq_length", type=int, default=2048)
     parser.add_argument(
         "--num_train_epochs",
         type=float,
         default=0.1,
-        help="正式跑的时候可以改大；debug 阶段只看能不能跑起来。",
+        help="keep small in debug",
     )
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
         default=1,
     )
-    # ★ 新增：验证集 batch size 配置
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
         default=1,
-        help="验证阶段 per-device batch size。",
+        help="verifying phase per-device batch size",
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -144,18 +143,17 @@ def main():
     parser.add_argument(
         "--max_steps",
         type=int,
-        default=10,  # ★ debug：只跑 10 步，确认环境 OK
-        help=">0 则优先使用 max_steps；= -1 则使用 num_train_epochs。",
+        default=10,
+        help=">0 prior to use max_steps；= -1 then use num_train_epochs",
     )
-    # ★ 新增：patience 早停配置（基于 eval_loss）
     parser.add_argument(
         "--early_stopping_patience",
         type=int,
         default=None,
         help=(
-            "如果设置为正整数，则启用 EarlyStoppingCallback，"
-            "当 eval_loss 连续这么多次 eval 都没有下降时提前停止训练。"
-            "如果为 None 或 <=0 则关闭早停。"
+            "if it is positive integer，use EarlyStoppingCallback，"
+            "when eval_loss stop decrease for this number, stop"
+            "if this is None then it will not stop early"
         ),
     )
 
@@ -163,10 +161,8 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # 如果启用 wandb，设置项目名环境变量
     if args.report_to == "wandb":
         os.environ["WANDB_PROJECT"] = args.wandb_project
-        # team / entity 可以在 sbatch 里通过 WANDB_ENTITY 设置
 
     print("=== Loading datasets from JSONL (pure Python list) ===")
     train_dataset = load_jsonl_dataset(args.train_jsonl)
@@ -183,18 +179,18 @@ def main():
         print("GPU 0:", torch.cuda.get_device_name(0))
     else:
         print("WARNING: torch.cuda.is_available() is False.")
-        print("         如果这是在 login 节点上跑的，请忽略；真正训练时请在 GPU 结点上用 sbatch 提交。")
+        print("        use sbatch to submit")
 
     print("=== Loading Qwen3-VL base model via Unsloth (no 4bit) ===")
     model_and_processors = FastVisionModel.from_pretrained(
         args.model_name,
         max_seq_length=args.max_seq_length,
-        load_in_4bit=False,          # ★ 禁用 4bit，避免 bitsandbytes 权重
+        load_in_4bit=False,          
         load_in_8bit=False,
-        use_gradient_checkpointing="unsloth",  # 减少显存 / 支持长序列
+        use_gradient_checkpointing="unsloth",
     )
 
-    # 兼容返回 (model, tokenizer, image_processor) / (model, tokenizer)
+    # robust to return (model, tokenizer, image_processor) / (model, tokenizer)
     if isinstance(model_and_processors, tuple):
         if len(model_and_processors) == 3:
             model, tokenizer, image_processor = model_and_processors
@@ -210,7 +206,7 @@ def main():
         tokenizer = None
         image_processor = None
 
-    # 挂 LoRA 适配器：语言 + 视觉 一起训
+    # apply LoRA adapter：text + vision together
     model = FastVisionModel.get_peft_model(
         model,
         finetune_vision_layers=True,
@@ -228,11 +224,11 @@ def main():
         modules_to_save=["lm_head", "embed_tokens"],
     )
 
-    # 启用训练模式（Unsloth 会做内部 patch）
+    # apply training（Unsloth will do patch）
     FastVisionModel.for_training(model)
 
-    # === 训练参数：用 SFTConfig + UnslothVisionDataCollator ===
-    # max_steps 与 num_train_epochs 二选一（优先使用 max_steps）
+    # === training parameter：apply SFTConfig + UnslothVisionDataCollator ===
+    # max_steps and num_train_epochs choose one（prior to use max_steps）
     if args.max_steps and args.max_steps > 0:
         max_steps = args.max_steps
         num_train_epochs = None
@@ -248,7 +244,7 @@ def main():
     sft_config_kwargs = dict(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,  # ★ 使用配置的 val batch size
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         warmup_ratio=args.warmup_ratio,
@@ -260,29 +256,29 @@ def main():
         save_total_limit=2,
         max_seq_length=args.max_seq_length,
 
-        # ★ wandb 相关
+        #  wandb related
         report_to=args.report_to,
         run_name=args.wandb_run_name,
 
-        # ★ 强制用纯 torch AdamW，避免 bitsandbytes optimizer
+        # force to use pure torch AdamW，avoid bitsandbytes optimizer
         optim="adamw_torch",
 
-        # vision 专用：让 Unsloth 自己处理 messages 结构
+        # vision only：let Unsloth deal messages structure
         remove_unused_columns=False,
         dataset_text_field="",
         dataset_kwargs={"skip_prepare_dataset": True},
         dataset_num_proc=4,
 
-        # ★ 为 early stopping / best model 做配置
+        # config for early stopping / best model
         load_best_model_at_end=use_early_stopping,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
     )
 
-    # 混合精度：按官方推荐，用 is_bf16_supported 判断
+    # mixed precision：according to official recommanded，apply is_bf16_supported to judge
     sft_config_kwargs["bf16"] = is_bf16_supported()
     sft_config_kwargs["fp16"] = not is_bf16_supported()
-    # DataLoader 多进程，加速一些预处理
+    # DataLoader multi processor to accelerate
     sft_config_kwargs["dataloader_num_workers"] = 4
 
     if max_steps is not None and max_steps > 0:
@@ -295,7 +291,7 @@ def main():
     print("=== Building callbacks (EarlyStopping) ===")
     callbacks = None
     if use_early_stopping:
-        # 基于 eval_loss 的早停；阈值 0.0 表示只要有更小的 loss 就认为有提升
+        # based on eval_loss early stop；threshold 0.0 means only smaller loss will be counted as progress
         callbacks = [
             EarlyStoppingCallback(
                 early_stopping_patience=args.early_stopping_patience,
