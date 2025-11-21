@@ -701,7 +701,6 @@ def main():
         warmup_ratio=0.1,
         num_generations=2,
 
-        # 你现在实验证明 4096 可以避开 image token mismatch
         max_prompt_length=args.max_seq_length,
         max_completion_length=args.max_completion_length,
 
