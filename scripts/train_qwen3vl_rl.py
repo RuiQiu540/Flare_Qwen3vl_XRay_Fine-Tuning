@@ -28,7 +28,7 @@ import types
 import sys
 from transformers import tokenization_utils_base as tub
 
-# ========= 1. 给 transformers 补上 AdamW（兼容老代码） =========
+# ========= 1. pack AdamW transformers (robust to old version) =========
 if not hasattr(transformers, "AdamW"):
     transformers.AdamW = torch.optim.AdamW
 
@@ -41,11 +41,10 @@ except Exception:
 if not hasattr(_tf_optim, "AdamW"):
     _tf_optim.AdamW = torch.optim.AdamW
 
-# ========= 2. 给 tokenizer 打补丁：忽略 add_special_tokens =========
+# ========= 2. pack tokenizer: ignore add_special_tokens =========
 _old_init = tub.PreTrainedTokenizerBase.__init__
 
 def _patched_init(self, *args, **kwargs):
-    # radgraph / 其它旧代码可能会传 add_special_tokens，这里统一丢掉
     if "add_special_tokens" in kwargs:
         kwargs.pop("add_special_tokens", None)
     return _old_init(self, *args, **kwargs)
@@ -54,7 +53,7 @@ tub.PreTrainedTokenizerBase.__init__ = _patched_init
 
 print("[DEBUG] Patched AdamW + tokenizer(add_special_tokens) for transformers")
 
-# ========= 3. 再导入 unsloth / trl / radgraph 等 =========
+# ========= 3. load unsloth / trl / radgraph =========
 from unsloth import FastVisionModel, is_bf16_supported
 from trl import GRPOTrainer, GRPOConfig
 import wandb
@@ -65,7 +64,6 @@ from radgraph import F1RadGraph
 
 
 def load_jsonl_dataset(jsonl_path: str):
-    """逐行读 jsonl，每行就是一条样本，保持 messages 结构不动。"""
     data = []
     n_total = 0
     n_bad = 0
@@ -395,13 +393,13 @@ def rouge_reward_func(prompts, completions, references, **kwargs):
         scores.append(float(val))
     return scores
 
-# 支持的多选题选项字母
+# support for multiple choice question
 MC_LABELS = set("ABCDEF")
 
 
 def _is_mc_reference(ref_text: str) -> bool:
     """
-    判断这个 reference 是否是 A/B/C/D/E/F 这种单个选项的多选题答案。
+    verify if reference is single answer question like A/B/C/D/E/F
     """
     if not isinstance(ref_text, str):
         ref_text = str(ref_text)
@@ -411,14 +409,13 @@ def _is_mc_reference(ref_text: str) -> bool:
 
 def _is_numeric_reference(ref_text: str) -> bool:
     """
-    判断 reference 是否是一个数值（允许小数、百分号）。
-    例如 '72', '73.5', '80%' 都算。
+    verify if reference is a float
+    including '72', '73.5', '80%'
     """
     if not isinstance(ref_text, str):
         ref_text = str(ref_text)
     ref_text = ref_text.strip()
 
-    # 去掉末尾的 %
     if ref_text.endswith("%"):
         ref_text = ref_text[:-1].strip()
 
@@ -430,14 +427,11 @@ def _is_numeric_reference(ref_text: str) -> bool:
 
 
 def _extract_first_float(text: str):
-    """
-    从模型输出中抽取第一个浮点数。
-    用于 ABR 这类数值题的 predicted value。
-    """
+    # extract first float
     if not isinstance(text, str):
         text = str(text)
 
-    # 允许 +1.23 / -0.5 / .8 / 12 等
+    # allow +1.23 / -0.5 / .8 / 12 etc.
     m = re.search(r"[-+]?\d*\.?\d+", text)
     if not m:
         return None
@@ -449,58 +443,53 @@ def _extract_first_float(text: str):
 def clinical_reward_func(prompts, completions, references, **kwargs):
     """Factual correctness reward via F1-RadGraph.
 
-    ✅ 对多选题 / 数值题：直接跳过 RadGraph，返回 0.0。
-    ✅ 对普通报告题：调用 RadGraph 计算 RG_ER，用作 factual reward。
+    for multi-selection question / float question：skip RadGraph，return 0.0。
+    for general report question：import RadGraph compute RG_ER，as factual reward。
     """
     num_completions = len(completions)
     if num_completions == 0:
         return []
 
-    # 展平 reference，保证和 completions 对齐
+    # make sure reference align to completions
     ref_texts = _flatten_reference_texts(references, num_completions)
 
-    # 全部转成字符串
+    # turn to string
     hyps_all = [c if isinstance(c, str) else str(c) for c in completions]
     refs_all = [r if isinstance(r, str) else str(r) for r in ref_texts]
 
-    # 先把所有分数初始化为 0.0
     scores = [0.0] * num_completions
 
-    # 只对“需要 RadGraph”的样本跑 F1，其余直接保持 0.0
+    # run F1 for samples need RadGraph，others keep 0.0
     hyps_rg = []
     refs_rg = []
-    positions = []  # 记录原始索引，方便 scatter 回去
+    positions = []
 
     for i, (hyp, ref) in enumerate(zip(hyps_all, refs_all)):
         ref_str = str(ref).strip()
 
-        # 多选题 or 数值题 → 跳过 RadGraph，scores[i] 保持 0.0
         if _is_mc_reference(ref_str) or _is_numeric_reference(ref_str):
             continue
 
-        # 其他情况（胸片报告等） → 送进 RadGraph
+        # other situation go to RadGraph
         hyps_rg.append(hyp)
         refs_rg.append(ref)
         positions.append(i)
 
-    # 如果没有样本需要 RadGraph，直接返回全 0
+    # if no sample need RadGraph，return all 0
     if not hyps_rg:
         return scores
 
     n = len(hyps_rg)
 
     try:
-        # 新版 radgraph API (>=0.1.x)
         mean_reward, reward_list, _, _ = f1radgraph(hyps=hyps_rg, refs=refs_rg)
-        # reward_list[i] 是一个 3-tuple: (rg_e, rg_er, rg_bar_er)
         rg_scores = []
         for tpl in reward_list:
             if isinstance(tpl, (list, tuple)) and len(tpl) >= 2:
-                rg_scores.append(float(tpl[1]))  # 取 RG_ER
+                rg_scores.append(float(tpl[1]))
             else:
                 rg_scores.append(float(tpl))
     except TypeError:
-        # 兼容旧版 API：f1radgraph(refs, hyps) 直接返回一个列表
         try:
             result = f1radgraph(refs_rg, hyps_rg)
             rg_scores = []
@@ -514,13 +503,11 @@ def clinical_reward_func(prompts, completions, references, **kwargs):
     except Exception:
         rg_scores = [0.0] * n
 
-    # 长度对齐一下（保险起见）
     if len(rg_scores) < n:
         rg_scores = rg_scores + [0.0] * (n - len(rg_scores))
     elif len(rg_scores) > n:
         rg_scores = rg_scores[:n]
 
-    # 把 RadGraph 分数 scatter 回原来的位置
     for pos, val in zip(positions, rg_scores):
         scores[pos] = float(val)
 
@@ -531,7 +518,6 @@ MC_LABELS = set("ABCDEF")
 
 
 def _is_mc_reference(ref_text: str) -> bool:
-    """参考答案是单个大写字母 A–F，就视为多选题。"""
     if not isinstance(ref_text, str):
         ref_text = str(ref_text)
     ref_text = ref_text.strip().upper()
@@ -539,7 +525,6 @@ def _is_mc_reference(ref_text: str) -> bool:
 
 
 def _is_numeric_reference(ref_text: str) -> bool:
-    """参考答案是一个纯数字，就视为数值题（比如 ABR%）。"""
     if not isinstance(ref_text, str):
         ref_text = str(ref_text)
     ref_text = ref_text.strip()
@@ -551,7 +536,6 @@ def _is_numeric_reference(ref_text: str) -> bool:
 
 
 def _extract_first_float(text: str):
-    """从模型输出中抽取第一个浮点数."""
     if not isinstance(text, str):
         text = str(text)
     text = text.replace(",", "")
@@ -564,38 +548,36 @@ def _extract_first_float(text: str):
         return None
 
 def combined_reward(prompts, completions, references, **kwargs):
-    """主 reward：区分单选题、数值题、普通报告题。"""
+    """main reward：distinguish MCQ、float question、text report question """
 
-    # 先统一算三种基础 reward
+    # compute reward
     f_scores = format_reward_func(prompts, completions, references, **kwargs)
     r_scores = rouge_reward_func(prompts, completions, references, **kwargs)
     c_scores = clinical_reward_func(prompts, completions, references, **kwargs)
 
-    # 展平参考答案，对齐 completions
+    # align answer to completions
     ref_texts = _flatten_reference_texts(references, len(completions))
 
     final_scores = []
     for comp, f1, r1, c1, ref_raw in zip(completions, f_scores, r_scores, c_scores, ref_texts):
-        # 统一成字符串
+        # unitify to string
         ref_str = ref_raw if isinstance(ref_raw, str) else str(ref_raw)
         ref_str = ref_str.strip()
         comp_text = comp if isinstance(comp, str) else str(comp)
 
-        # ==================== 1) 多选题（A/B/C/D/E/F） ====================
+        # ==================== 1) Multiple Choice Question（A/B/C/D/E/F） ====================
         if _is_mc_reference(ref_str):
-            # 在输出里找第一个独立出现的 A-F（单词边界，避免 "Based" 这种干扰）
             comp_upper = comp_text.upper()
             m = re.search(r"\b([A-F])\b", comp_upper)
             pred_label = m.group(1) if m else None
 
             if pred_label == ref_str.upper():
-                score = 1.0   # 选对就直接给满分
+                score = 1.0
             else:
-                score = -0.2  # 选错/没找到，轻微惩罚
+                score = -0.2
 
-        # ==================== 2) 数值 ABR 题 ====================
+        # ==================== 2) Float ABR Question ====================
         elif _is_numeric_reference(ref_str):
-            # 参考数值（去掉 % 后再转 float）
             ref_clean = ref_str
             if ref_clean.endswith("%"):
                 ref_clean = ref_clean[:-1].strip()
@@ -604,16 +586,13 @@ def combined_reward(prompts, completions, references, **kwargs):
             except ValueError:
                 gold = None
 
-            # 模型预测的数值
             pred = _extract_first_float(comp_text)
 
             if gold is None or pred is None:
-                # label 非法或模型完全没写出数字
                 value_term = -0.5
             else:
                 abs_err = abs(pred - gold)
 
-                # 误差分段打分（可以之后再微调）
                 if abs_err <= 2:
                     value_term = 1.0
                 elif abs_err <= 5:
@@ -623,11 +602,9 @@ def combined_reward(prompts, completions, references, **kwargs):
                 else:
                     value_term = -0.5
 
-                # 如果特别离谱（<0 或 >100），再额外扣一点
                 if pred < 0 or pred > 100:
                     value_term -= 0.3
 
-            # 长度 + 格式奖励：希望也写一个简短的解释
             n_tokens = len(comp_text.strip().split())
             if n_tokens >= 15:
                 len_bonus = 0.2
@@ -638,18 +615,16 @@ def combined_reward(prompts, completions, references, **kwargs):
 
             fmt_term = f1 + len_bonus
 
-            # 数值为主，格式为辅
             score = 0.7 * value_term + 0.3 * fmt_term
 
-        # ==================== 3) 普通胸片报告 ====================
+        # ==================== 3) regular chest report ====================
         else:
-            # 保留原来的加权方式：
-            #   0.7 * 临床事实性（RadGraph）
-            #   0.2 * Findings/Impression 格式
+            #   0.7 * Fact（RadGraph）
+            #   0.2 * Findings/Impression format
             #   0.1 * ROUGE-L
             score = 0.7 * c1 + 0.2 * f1 + 0.1 * r1
 
-        # 稳定性：clip 到 [-2, 2]
+        # stability：clip to [-2, 2]
         score = max(min(score, 2.0), -2.0)
         final_scores.append(float(score))
 
@@ -714,9 +689,6 @@ def main():
     print("=== Loading JSONL dataset ===")
     train_data = load_rl_dataset(args.train_jsonl)
 
-    # 不要在这里 tokenizer.apply_chat_template
-    # 多模态 GRPO 会自己用 messages + images 来构建输入
-
 
     # ============================================================
     # GRPO Trainer
@@ -741,7 +713,6 @@ def main():
         output_dir=args.output_dir,
         save_steps=100,
 
-        # ★ 关键：和 SFT 一样，禁用 bitsandbytes optimizer
         optim="adamw_torch",
     )
 
