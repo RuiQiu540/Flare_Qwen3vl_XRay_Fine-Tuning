@@ -1,0 +1,36 @@
+# Main RL (GRPO) config for FLARE Task 5
+
+data:
+  train_jsonl: data/train_sft.jsonl
+
+model:
+  sft_checkpoint: checkpoints/SFT_full/checkpoint-550
+  max_seq_length: 13000
+  max_completion_length: 256
+
+training:
+  output_dir: checkpoints/RL_grpo_bs5_steps800_len12k
+  max_steps: 1000 # stopped at 700
+  batch_size: 4
+  grad_accum: 1
+  lr: 5e-6
+
+logging:
+  report_to: wandb
+  wandb_project: flare_task5_rl
+  wandb_run_name: qwen3vl_rl_bs5_len12k
+
+environment:
+  platform: "Alliance (Compute Canada) Fir cluster"
+  slurm:
+    comment: "RL jobs launched interactively with salloc"
+    gres: "--gres=gpu:nvidia_h100_80gb_hdm3_3g.40gb:1"
+    cpus_per_task: 4
+    mem: "32G"
+  hardware: >
+    RL experiments were launched via `salloc` on Fir, using a single
+    NVIDIA H100 80GB GPU partitioned as a 3g.40gb MIG slice
+    (`gpu:nvidia_h100_80gb_hdm3_3g.40gb:1`), with 4 CPU cores and
+    32 GB system RAM. Any comparable 40 GB-class GPU (e.g., an H100
+    MIG 3g.40gb slice) with similar CPU/RAM resources should be able
+    to reproduce the RL runs.

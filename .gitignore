@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# log and temp
+*.log
+*.tmp
+
+# checkpoint/large file
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+checkpoints/
+logs/
+wandb/
+outputs/
+runs/

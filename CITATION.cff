@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this repository, please cite it as below."
+title: "FLARE Task 5 X-ray Report Generation with Qwen3-VL-4B and Unsloth"
+authors:
+  - family-names: "Qiu"
+    given-names: "Rui (Ray)"
+version: "0.1.0"
+date-released: "2025-11-20"
+repository-code: "https://github.com/yourname/your-repo"

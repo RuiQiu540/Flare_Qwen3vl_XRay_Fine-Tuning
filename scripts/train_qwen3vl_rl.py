@@ -1,0 +1,771 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+===========================================================
+ Reinforcement Learning (GRPO) for Qwen3-VL-4B
+ FLARE Task 5 – X-ray Report Generation
+===========================================================
+Works with Unsloth + SFT LoRA checkpoints.
+"""
+
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+import json
+import argparse
+import re
+
+import torch
+import transformers
+import types
+import sys
+from transformers import tokenization_utils_base as tub
+
+# ========= 1. 给 transformers 补上 AdamW（兼容老代码） =========
+if not hasattr(transformers, "AdamW"):
+    transformers.AdamW = torch.optim.AdamW
+
+try:
+    import transformers.optimization as _tf_optim
+except Exception:
+    _tf_optim = types.ModuleType("transformers.optimization")
+    sys.modules["transformers.optimization"] = _tf_optim
+
+if not hasattr(_tf_optim, "AdamW"):
+    _tf_optim.AdamW = torch.optim.AdamW
+
+# ========= 2. 给 tokenizer 打补丁：忽略 add_special_tokens =========
+_old_init = tub.PreTrainedTokenizerBase.__init__
+
+def _patched_init(self, *args, **kwargs):
+    # radgraph / 其它旧代码可能会传 add_special_tokens，这里统一丢掉
+    if "add_special_tokens" in kwargs:
+        kwargs.pop("add_special_tokens", None)
+    return _old_init(self, *args, **kwargs)
+
+tub.PreTrainedTokenizerBase.__init__ = _patched_init
+
+print("[DEBUG] Patched AdamW + tokenizer(add_special_tokens) for transformers")
+
+# ========= 3. 再导入 unsloth / trl / radgraph 等 =========
+from unsloth import FastVisionModel, is_bf16_supported
+from trl import GRPOTrainer, GRPOConfig
+import wandb
+
+from rouge_score import rouge_scorer
+from radgraph import F1RadGraph
+
+
+
+def load_jsonl_dataset(jsonl_path: str):
+    """逐行读 jsonl，每行就是一条样本，保持 messages 结构不动。"""
+    data = []
+    n_total = 0
+    n_bad = 0
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            n_total += 1
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception as e:
+                print(f"[warn] 解析 {jsonl_path} 第 {n_total} 行失败, 跳过: {e}")
+                n_bad += 1
+                continue
+            data.append(obj)
+    print(f"[data] loaded {len(data)} samples from {jsonl_path}, bad lines = {n_bad}")
+    return data
+
+
+# ============================================================
+# CLI
+# ============================================================
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--train_jsonl", type=str, required=True)
+    parser.add_argument("--sft_checkpoint", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+
+    parser.add_argument("--wandb_project", type=str, default="flare_task5_rl")
+    parser.add_argument("--wandb_run_name", type=str, default="qwen3vl_rl")
+    parser.add_argument("--report_to", type=str, default="wandb", choices=["none", "wandb"])
+
+    parser.add_argument("--max_steps", type=int, default=300)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--grad_accum", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=5e-6)
+    parser.add_argument("--max_seq_length", type=int, default=2048)
+    parser.add_argument("--max_completion_length", type=int, default=512)
+    return parser.parse_args()
+
+
+# ============================================================
+# Load JSONL dataset → GRPO format
+# ============================================================
+# ============================================================
+# Load JSONL dataset → GRPO format
+# ============================================================
+def load_rl_dataset(path):
+    """Load RL dataset from SFT-style JSONL.
+
+    Expected JSONL format (train_sft.jsonl / val_sft.jsonl):
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": "..."},
+                    ...,
+                    {"type": "text", "text": "question or instruction"}
+                ]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "reference report"}
+                ]
+            }
+        ]
+    }
+
+    We convert this into a list of dicts with keys:
+      - "prompt": a single user message (chat format) with image placeholders
+      - "images": list of image paths
+      - "references": list[str], ground-truth report text
+    """
+    items = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            ex = json.loads(line)
+
+            messages = ex.get("messages", [])
+            if not messages:
+                continue
+
+            # First user + first assistant as in SFT data
+            user_msg = next((m for m in messages if m.get("role") == "user"), None)
+            assistant_msg = next((m for m in messages if m.get("role") == "assistant"), None)
+            if user_msg is None or assistant_msg is None:
+                continue
+
+            user_content = user_msg.get("content", [])
+            assistant_content = assistant_msg.get("content", [])
+
+            # Extract image paths from user content
+            images = [
+                c.get("image")
+                for c in user_content
+                if isinstance(c, dict) and c.get("type") == "image" and c.get("image")
+            ]
+
+            # Extract first user text as the question
+            user_texts = [
+                c.get("text", "")
+                for c in user_content
+                if isinstance(c, dict) and c.get("type") == "text"
+            ]
+            prompt_text = user_texts[0] if user_texts else ""
+
+            # Extract assistant reference text (usually a single text chunk)
+            ref_text_parts = []
+            if isinstance(assistant_content, list):
+                for c in assistant_content:
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        ref_text_parts.append(c.get("text", ""))
+                    elif isinstance(c, str):
+                        ref_text_parts.append(c)
+            elif isinstance(assistant_content, str):
+                ref_text_parts.append(assistant_content)
+            reference_text = "\n".join(p for p in ref_text_parts if p).strip()
+
+            if not reference_text:
+                # Skip samples with no usable reference
+                continue
+
+            # Build a chat-style prompt with one user turn.
+            # Use one image placeholder per image so the collator can bind them.
+            content = []
+            for _ in images:
+                content.append({"type": "image"})
+            # Always keep the question text last.
+            content.append({"type": "text", "text": prompt_text})
+
+            prompt = [
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ]
+
+            items.append(
+                {
+                    "prompt": prompt,
+                    "images": images,
+                    # Keep as a list so GRPO can broadcast to multiple completions
+                    "references": [reference_text],
+                }
+            )
+
+    return items
+
+
+
+# ============================================================
+# Reward functions
+# ============================================================
+rouge = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+
+# Instantiate RadGraph F1 scorer once (this is heavy).
+# You can switch model_type to "radgraph" if you prefer the smaller v1 model.
+f1radgraph = F1RadGraph(reward_level="all", model_type="radgraph-xl")
+
+
+def _flatten_reference_texts(references, num_completions):
+    """Normalize `references` into a list of plain strings aligned with `completions`.
+
+    In our dataset we store:
+        "references": [reference_text]
+    but GRPO may broadcast this to match the number of generations.
+    This helper makes the reward code robust to shapes like:
+        ["ref text"]
+        [["ref text"], ["ref2"]]
+        ["ref text 1", "ref text 2"]
+    """
+    if not isinstance(references, (list, tuple)):
+        return [str(references)] * num_completions
+
+    # If already length == num_completions, just normalize each element.
+    if len(references) == num_completions:
+        base_list = list(references)
+    elif len(references) == 1:
+        # Broadcast single ref to all completions
+        base_list = [references[0]] * num_completions
+    else:
+        # Fallback: repeat / truncate
+        base_list = list(references)
+        if len(base_list) < num_completions:
+            base_list = base_list + [base_list[-1]] * (num_completions - len(base_list))
+        elif len(base_list) > num_completions:
+            base_list = base_list[:num_completions]
+
+    texts = []
+    for r in base_list:
+        if isinstance(r, str):
+            texts.append(r)
+        elif isinstance(r, (list, tuple)) and r:
+            inner = r[0]
+            texts.append(inner if isinstance(inner, str) else str(inner))
+        else:
+            texts.append(str(r))
+    return texts
+
+
+def _extract_sections(text):
+    """Return a dict with 'findings' / 'impression' sections if present.
+
+    We look for headings like:
+        Findings:
+        Impression:
+    (case-insensitive, at line starts) and slice the text accordingly.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+
+    findings_re = re.compile(r'^\s*findings?\s*[:\-]', re.IGNORECASE | re.MULTILINE)
+    impression_re = re.compile(
+        r'^\s*impressions?\s*[:\-]|^\s*impression\s*[:\-]',
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    sections = {}
+    length = len(text)
+
+    f_match = findings_re.search(text)
+    i_match = impression_re.search(text)
+
+    def slice_section(start_match, other_match):
+        if not start_match:
+            return ""
+        start = start_match.end()
+        end_candidates = []
+        if other_match and other_match.start() > start:
+            end_candidates.append(other_match.start())
+        end = min(end_candidates) if end_candidates else length
+        return text[start:end].strip()
+
+    if f_match:
+        sections["findings"] = slice_section(f_match, i_match)
+    if i_match:
+        sections["impression"] = slice_section(i_match, f_match)
+
+    return sections
+
+
+def _split_sentences(s):
+    s = re.sub(r'\s+', ' ', s.strip())
+    if not s:
+        return []
+    # Very simple sentence split for overlap checks.
+    parts = re.split(r'(?<=[\.!?])\s+', s)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def format_reward_func(prompts, completions, references, **kwargs):
+    """Reward basic formatting & section usage.
+
+    Goals:
+      1. Encourage presence of distinct Findings / Impression sections.
+      2. Penalize mixing / duplicating content between sections.
+      3. Mildly penalize obvious debug / reasoning artefacts.
+    """
+    scores = []
+    for c in completions:
+        text = c if isinstance(c, str) else str(c)
+
+        score = 0.0
+
+        # Length sanity: avoid extremely short / extremely long outputs.
+        n_tokens = len(text.strip().split())
+        if 20 <= n_tokens <= 400:
+            score += 0.3
+        elif n_tokens < 10:
+            score -= 0.3
+
+        sections = _extract_sections(text)
+        f_text = sections.get("findings", "")
+        i_text = sections.get("impression", "")
+
+        has_f = bool(f_text)
+        has_i = bool(i_text)
+
+        if has_f and has_i:
+            # Both sections present: strong reward.
+            score += 0.7
+        elif has_f or has_i:
+            # Only one of them present: smaller reward.
+            score += 0.3
+
+        # Penalize obvious debugging / reasoning artefacts.
+        if "<REASONING>" in text:
+            score -= 1.0
+        if "addCriterion" in text:
+            score -= 1.0
+
+        # Encourage that Findings and Impression are not copy-paste identical.
+        if has_f and has_i:
+            f_sents = set(_split_sentences(f_text.lower()))
+            i_sents = set(_split_sentences(i_text.lower()))
+            if f_sents and i_sents:
+                jaccard = len(f_sents & i_sents) / max(1, len(f_sents | i_sents))
+                # jaccard = 1: sections identical -> big penalty.
+                # jaccard = 0: no overlap -> bonus.
+                score += 0.6 * (1.0 - jaccard)  # in [0, 0.6]
+
+        # Clamp score to a reasonable range.
+        score = max(min(score, 2.0), -2.0)
+        scores.append(score)
+
+    return scores
+
+
+def rouge_reward_func(prompts, completions, references, **kwargs):
+    """ROUGE-L between generation and reference report."""
+    scores = []
+    ref_texts = _flatten_reference_texts(references, len(completions))
+    for gen, ref in zip(completions, ref_texts):
+        g = gen if isinstance(gen, str) else str(gen)
+        r = ref if isinstance(ref, str) else str(ref)
+        try:
+            val = rouge.score(r, g)["rougeL"].fmeasure
+        except Exception:
+            val = 0.0
+        scores.append(float(val))
+    return scores
+
+# 支持的多选题选项字母
+MC_LABELS = set("ABCDEF")
+
+
+def _is_mc_reference(ref_text: str) -> bool:
+    """
+    判断这个 reference 是否是 A/B/C/D/E/F 这种单个选项的多选题答案。
+    """
+    if not isinstance(ref_text, str):
+        ref_text = str(ref_text)
+    ref_text = ref_text.strip().upper()
+    return len(ref_text) == 1 and ref_text in MC_LABELS
+
+
+def _is_numeric_reference(ref_text: str) -> bool:
+    """
+    判断 reference 是否是一个数值（允许小数、百分号）。
+    例如 '72', '73.5', '80%' 都算。
+    """
+    if not isinstance(ref_text, str):
+        ref_text = str(ref_text)
+    ref_text = ref_text.strip()
+
+    # 去掉末尾的 %
+    if ref_text.endswith("%"):
+        ref_text = ref_text[:-1].strip()
+
+    try:
+        float(ref_text)
+        return True
+    except ValueError:
+        return False
+
+
+def _extract_first_float(text: str):
+    """
+    从模型输出中抽取第一个浮点数。
+    用于 ABR 这类数值题的 predicted value。
+    """
+    if not isinstance(text, str):
+        text = str(text)
+
+    # 允许 +1.23 / -0.5 / .8 / 12 等
+    m = re.search(r"[-+]?\d*\.?\d+", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+def clinical_reward_func(prompts, completions, references, **kwargs):
+    """Factual correctness reward via F1-RadGraph.
+
+    ✅ 对多选题 / 数值题：直接跳过 RadGraph，返回 0.0。
+    ✅ 对普通报告题：调用 RadGraph 计算 RG_ER，用作 factual reward。
+    """
+    num_completions = len(completions)
+    if num_completions == 0:
+        return []
+
+    # 展平 reference，保证和 completions 对齐
+    ref_texts = _flatten_reference_texts(references, num_completions)
+
+    # 全部转成字符串
+    hyps_all = [c if isinstance(c, str) else str(c) for c in completions]
+    refs_all = [r if isinstance(r, str) else str(r) for r in ref_texts]
+
+    # 先把所有分数初始化为 0.0
+    scores = [0.0] * num_completions
+
+    # 只对“需要 RadGraph”的样本跑 F1，其余直接保持 0.0
+    hyps_rg = []
+    refs_rg = []
+    positions = []  # 记录原始索引，方便 scatter 回去
+
+    for i, (hyp, ref) in enumerate(zip(hyps_all, refs_all)):
+        ref_str = str(ref).strip()
+
+        # 多选题 or 数值题 → 跳过 RadGraph，scores[i] 保持 0.0
+        if _is_mc_reference(ref_str) or _is_numeric_reference(ref_str):
+            continue
+
+        # 其他情况（胸片报告等） → 送进 RadGraph
+        hyps_rg.append(hyp)
+        refs_rg.append(ref)
+        positions.append(i)
+
+    # 如果没有样本需要 RadGraph，直接返回全 0
+    if not hyps_rg:
+        return scores
+
+    n = len(hyps_rg)
+
+    try:
+        # 新版 radgraph API (>=0.1.x)
+        mean_reward, reward_list, _, _ = f1radgraph(hyps=hyps_rg, refs=refs_rg)
+        # reward_list[i] 是一个 3-tuple: (rg_e, rg_er, rg_bar_er)
+        rg_scores = []
+        for tpl in reward_list:
+            if isinstance(tpl, (list, tuple)) and len(tpl) >= 2:
+                rg_scores.append(float(tpl[1]))  # 取 RG_ER
+            else:
+                rg_scores.append(float(tpl))
+    except TypeError:
+        # 兼容旧版 API：f1radgraph(refs, hyps) 直接返回一个列表
+        try:
+            result = f1radgraph(refs_rg, hyps_rg)
+            rg_scores = []
+            for tpl in result:
+                if isinstance(tpl, (list, tuple)) and len(tpl) >= 2:
+                    rg_scores.append(float(tpl[1]))
+                else:
+                    rg_scores.append(float(tpl))
+        except Exception:
+            rg_scores = [0.0] * n
+    except Exception:
+        rg_scores = [0.0] * n
+
+    # 长度对齐一下（保险起见）
+    if len(rg_scores) < n:
+        rg_scores = rg_scores + [0.0] * (n - len(rg_scores))
+    elif len(rg_scores) > n:
+        rg_scores = rg_scores[:n]
+
+    # 把 RadGraph 分数 scatter 回原来的位置
+    for pos, val in zip(positions, rg_scores):
+        scores[pos] = float(val)
+
+    return scores
+
+
+MC_LABELS = set("ABCDEF")
+
+
+def _is_mc_reference(ref_text: str) -> bool:
+    """参考答案是单个大写字母 A–F，就视为多选题。"""
+    if not isinstance(ref_text, str):
+        ref_text = str(ref_text)
+    ref_text = ref_text.strip().upper()
+    return len(ref_text) == 1 and ref_text in MC_LABELS
+
+
+def _is_numeric_reference(ref_text: str) -> bool:
+    """参考答案是一个纯数字，就视为数值题（比如 ABR%）。"""
+    if not isinstance(ref_text, str):
+        ref_text = str(ref_text)
+    ref_text = ref_text.strip()
+    try:
+        float(ref_text)
+        return True
+    except ValueError:
+        return False
+
+
+def _extract_first_float(text: str):
+    """从模型输出中抽取第一个浮点数."""
+    if not isinstance(text, str):
+        text = str(text)
+    text = text.replace(",", "")
+    m = re.search(r"(-?\d+(?:\.\d+)?)", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+def combined_reward(prompts, completions, references, **kwargs):
+    """主 reward：区分单选题、数值题、普通报告题。"""
+
+    # 先统一算三种基础 reward
+    f_scores = format_reward_func(prompts, completions, references, **kwargs)
+    r_scores = rouge_reward_func(prompts, completions, references, **kwargs)
+    c_scores = clinical_reward_func(prompts, completions, references, **kwargs)
+
+    # 展平参考答案，对齐 completions
+    ref_texts = _flatten_reference_texts(references, len(completions))
+
+    final_scores = []
+    for comp, f1, r1, c1, ref_raw in zip(completions, f_scores, r_scores, c_scores, ref_texts):
+        # 统一成字符串
+        ref_str = ref_raw if isinstance(ref_raw, str) else str(ref_raw)
+        ref_str = ref_str.strip()
+        comp_text = comp if isinstance(comp, str) else str(comp)
+
+        # ==================== 1) 多选题（A/B/C/D/E/F） ====================
+        if _is_mc_reference(ref_str):
+            # 在输出里找第一个独立出现的 A-F（单词边界，避免 "Based" 这种干扰）
+            comp_upper = comp_text.upper()
+            m = re.search(r"\b([A-F])\b", comp_upper)
+            pred_label = m.group(1) if m else None
+
+            if pred_label == ref_str.upper():
+                score = 1.0   # 选对就直接给满分
+            else:
+                score = -0.2  # 选错/没找到，轻微惩罚
+
+        # ==================== 2) 数值 ABR 题 ====================
+        elif _is_numeric_reference(ref_str):
+            # 参考数值（去掉 % 后再转 float）
+            ref_clean = ref_str
+            if ref_clean.endswith("%"):
+                ref_clean = ref_clean[:-1].strip()
+            try:
+                gold = float(ref_clean)
+            except ValueError:
+                gold = None
+
+            # 模型预测的数值
+            pred = _extract_first_float(comp_text)
+
+            if gold is None or pred is None:
+                # label 非法或模型完全没写出数字
+                value_term = -0.5
+            else:
+                abs_err = abs(pred - gold)
+
+                # 误差分段打分（可以之后再微调）
+                if abs_err <= 2:
+                    value_term = 1.0
+                elif abs_err <= 5:
+                    value_term = 0.5
+                elif abs_err <= 10:
+                    value_term = 0.0
+                else:
+                    value_term = -0.5
+
+                # 如果特别离谱（<0 或 >100），再额外扣一点
+                if pred < 0 or pred > 100:
+                    value_term -= 0.3
+
+            # 长度 + 格式奖励：希望也写一个简短的解释
+            n_tokens = len(comp_text.strip().split())
+            if n_tokens >= 15:
+                len_bonus = 0.2
+            elif n_tokens <= 3:
+                len_bonus = -0.2
+            else:
+                len_bonus = 0.0
+
+            fmt_term = f1 + len_bonus
+
+            # 数值为主，格式为辅
+            score = 0.7 * value_term + 0.3 * fmt_term
+
+        # ==================== 3) 普通胸片报告 ====================
+        else:
+            # 保留原来的加权方式：
+            #   0.7 * 临床事实性（RadGraph）
+            #   0.2 * Findings/Impression 格式
+            #   0.1 * ROUGE-L
+            score = 0.7 * c1 + 0.2 * f1 + 0.1 * r1
+
+        # 稳定性：clip 到 [-2, 2]
+        score = max(min(score, 2.0), -2.0)
+        final_scores.append(float(score))
+
+    return final_scores
+
+
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    args = parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.report_to == "wandb":
+        os.environ["WANDB_PROJECT"] = args.wandb_project
+        wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
+
+    print("=== Loading SFT checkpoint ===")
+    loaded = FastVisionModel.from_pretrained(
+        args.sft_checkpoint,
+        max_seq_length=args.max_seq_length,
+        load_in_4bit=False,
+        load_in_8bit=False,
+        use_gradient_checkpointing="unsloth",
+    )
+
+    # Handle Unsloth unpacking
+    if isinstance(loaded, tuple):
+        if len(loaded) == 2:
+            model, tokenizer = loaded
+            image_processor = None
+        elif len(loaded) == 3:
+            model, tokenizer, image_processor = loaded
+        else:
+            raise RuntimeError("Unknown return format from FastVisionModel.")
+    else:
+        model = loaded
+        tokenizer = None
+        image_processor = None
+
+    # Load missing image processor
+    if image_processor is None:
+        print("SFT checkpoint missing image processor — loading from base model...")
+        base = FastVisionModel.from_pretrained("unsloth/Qwen3-VL-4B-Instruct")
+        if len(base) == 3:
+            _, tokenizer, image_processor = base
+        elif len(base) == 2:
+            _, tokenizer_base = base
+            if hasattr(tokenizer_base, "image_processor"):
+                image_processor = tokenizer_base.image_processor
+            else:
+                raise RuntimeError("Base model tokenizer has no image_processor.")
+        else:
+            raise RuntimeError("Base model returned unexpected values.")
+
+    # ============================================================
+    # Load dataset (keep multimodal messages as-is)
+    # ============================================================
+    print("=== Loading JSONL dataset ===")
+    train_data = load_rl_dataset(args.train_jsonl)
+
+    # 不要在这里 tokenizer.apply_chat_template
+    # 多模态 GRPO 会自己用 messages + images 来构建输入
+
+
+    # ============================================================
+    # GRPO Trainer
+    # ============================================================
+    print("=== Building GRPOConfig ===")
+    training_args = GRPOConfig(
+        learning_rate=args.lr,
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        warmup_ratio=0.1,
+        num_generations=2,
+
+        # 你现在实验证明 4096 可以避开 image token mismatch
+        max_prompt_length=args.max_seq_length,
+        max_completion_length=args.max_completion_length,
+
+        importance_sampling_level="sequence",
+        loss_type="dr_grpo",
+        bf16=is_bf16_supported(),
+        max_steps=args.max_steps,
+        report_to=args.report_to,
+        output_dir=args.output_dir,
+        save_steps=100,
+
+        # ★ 关键：和 SFT 一样，禁用 bitsandbytes optimizer
+        optim="adamw_torch",
+    )
+
+
+
+    print("=== Initializing GRPOTrainer ===")
+    trainer = GRPOTrainer(
+        model=model,
+        args=training_args,
+        processing_class=tokenizer,
+        reward_funcs=[combined_reward],
+        train_dataset=train_data,
+    )
+
+    print("=== Starting RL training ===")
+    trainer.train()
+
+    print("=== Saving RL model ===")
+    model.save_pretrained(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    image_processor.save_pretrained(args.output_dir)
+
+    print(f"[DONE] RL saved to {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()

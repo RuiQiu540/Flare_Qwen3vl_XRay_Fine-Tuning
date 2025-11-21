@@ -1,0 +1,51 @@
+name: unsloth_flare
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pip
+  # Core PyTorch stack (adjust version/CUDA to match your hardware)
+  - pytorch>=2.3
+  - torchvision
+  - torchaudio
+  # If you need a specific CUDA toolkit via conda, uncomment and set an appropriate version, e.g.:
+  # - cudatoolkit=12.1
+
+  - pip:
+      # HF / Unsloth related libraries
+      - accelerate==1.11.0
+      - bitsandbytes==0.48.2
+      - datasets==4.3.0
+      - huggingface_hub==0.36.0
+      - transformers==4.57.0
+      - trl==0.25.1
+      - peft==0.18.0
+      - sentencepiece==0.2.0
+
+      # Unsloth core (pinned to the commit used in our experiments)
+      - "unsloth @ git+https://github.com/unslothai/unsloth.git@ac7a478e6f01f0b659451d4d8ee6893957c747eb"
+      - unsloth_zoo==2025.11.4
+
+      # Evaluation stack: RadGraph + GREEN metrics
+      - radgraph==0.1.0
+      - rouge-score==0.1.2
+      - nltk==3.9.2
+
+      # Logging & experiment tracking
+      - wandb==0.21.2
+
+      # Scientific computing and plotting
+      - numpy==1.26.4
+      - pandas==2.3.3
+      - scipy==1.15.1
+      - matplotlib==3.10.0
+      - pillow
+
+      # Development & notebook tooling (optional)
+      - ipykernel
+      - jupyterlab
+      - tqdm
