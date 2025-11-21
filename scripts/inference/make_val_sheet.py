@@ -13,7 +13,7 @@ from unsloth.trainer import UnslothVisionDataCollator
 
 
 def load_jsonl_dataset(jsonl_path: str):
-    """和 train_qwen3vl_sft.py / infer_qwen3vl_tiny.py 保持一致，直接读 jsonl。"""
+    """和 train_qwen3vl_sft.py / infer_qwen3vl_tiny.py keep same，directly read jsonl。"""
     data = []
     n_total = 0
     n_bad = 0
@@ -26,7 +26,7 @@ def load_jsonl_dataset(jsonl_path: str):
             try:
                 data.append(json.loads(line))
             except Exception as e:
-                print(f"[warn] 解析 {jsonl_path} 第 {n_total} 行失败, 跳过: {e}")
+                print(f"[warn] analyze line {jsonl_path} {n_total} row fail, skip: {e}")
                 n_bad += 1
     print(f"[data] loaded {len(data)} samples from {jsonl_path}, bad lines = {n_bad}")
     return data
@@ -34,8 +34,8 @@ def load_jsonl_dataset(jsonl_path: str):
 
 def extract_text_from_content(content):
     """
-    把 Qwen3-VL 的 content 结构（可能是 str 或 list[dict{type,text}]）抽成纯文本。
-    和 infer_qwen3vl_tiny.py 里面保持一致。
+    extract Qwen3-VL's content structure (might be str or list[dict{type,text}]) to pure text。
+    keep inside same to infer_qwen3vl_tiny.py
     """
     if isinstance(content, str):
         return content
@@ -53,8 +53,8 @@ def extract_text_from_content(content):
 
 def extract_image_names_from_messages(messages):
     """
-    从 messages 里找到所有 image 的路径，取 basename，多个用分号拼接.
-    例如: "img1.jpg; img2.jpg"
+    from messages finding all image path，extract basename，use ; when merge multiple.
+    such as: "img1.jpg; img2.jpg"
     """
     names = []
     for m in messages:
@@ -70,21 +70,21 @@ def extract_image_names_from_messages(messages):
 
 def build_prompt_and_target_from_messages(messages):
     """
-    从 messages 里拆：
-    - prompt_messages: 所有 assistant 之前的轮次（一般就是 user/system）
-    - target_text: 最后一个 assistant 的文本（label）
+    split from messages：
+    - prompt_messages: all assistant before previous round (generally user/system)
+    - target_text: last assistant text (label)
     """
     if not messages:
         return [], ""
 
-    # 找最后一个 assistant，当作 label
+    # find last assistant，as label
     target_text = ""
     for m in reversed(messages):
         if m.get("role") == "assistant":
             target_text = extract_text_from_content(m.get("content", ""))
             break
 
-    # prompt = 第一个 assistant 之前的所有 messages
+    # prompt = first assistant all previous messages
     prompt_messages = []
     for m in messages:
         if m.get("role") == "assistant":
@@ -92,7 +92,7 @@ def build_prompt_and_target_from_messages(messages):
         prompt_messages.append(m)
 
     if not prompt_messages:
-        prompt_messages = messages  # 兜底
+        prompt_messages = messages  # robust
 
     return prompt_messages, target_text
 
@@ -109,7 +109,7 @@ def parse_args():
         "--ckpt_dir",
         type=str,
         required=True,
-        help="要推理的模型 checkpoint 目录，比如 RL 的 checkpoint-700",
+        help="model need to inference checkpoint directory，such as RL checkpoint-700",
     )
     parser.add_argument(
         "--max_seq_length",
@@ -125,20 +125,20 @@ def parse_args():
         "--num_samples",
         type=int,
         default=50,
-        help="最多抽多少个样本写进表，如果 <=0 就用全部",
+        help="at most how many sample is in, if <=0 use all",
     )
     parser.add_argument(
         "--output_xlsx",
         type=str,
         required=True,
-        help="输出 Excel 路径，比如 /home/.../val_examples_rl.xlsx",
+        help="output Excel path, such as /home/.../val_examples_rl.xlsx",
     )
     return parser.parse_args()
 
 
 def load_model_and_tokenizer(ckpt_dir: str, max_seq_length: int = 2048):
     """
-    和 infer_qwen3vl_tiny.py 一样，用 FastVisionModel.from_pretrained.
+    keep same to infer_qwen3vl_tiny.py，apply FastVisionModel.from_pretrained.
     """
     print(f"[model] loading from: {ckpt_dir}")
     model_and_processors = FastVisionModel.from_pretrained(
@@ -171,22 +171,22 @@ def load_model_and_tokenizer(ckpt_dir: str, max_seq_length: int = 2048):
 @torch.no_grad()
 def generate_answer_for_sample(sample, model, tokenizer, device, max_new_tokens, max_seq_length):
     """
-    给一个 sample，用当前模型生成回答（只看 prompt，不看 label）。
-    返回 Question, GT Answer, 以及模型输出。
+    generate with sample，use current model to infere (only check prompt, not label).
+    return Question, GT Answer, and model output.
     """
     data_collator = UnslothVisionDataCollator(model, tokenizer)
 
     messages = sample.get("messages", [])
     prompt_messages, target_text = build_prompt_and_target_from_messages(messages)
 
-    # 抽 user 的文本当 Question
+    # extract text in user as Question
     prompt_texts = []
     for m in prompt_messages:
         if m.get("role") == "user":
             prompt_texts.append(extract_text_from_content(m.get("content", "")))
     prompt_text = "\n".join(p for p in prompt_texts if p)
 
-    # 只保留 prompt 的 messages 送进 collator
+    # only keep prompt's messages, send to collator
     infer_sample = deepcopy(sample)
     infer_sample["messages"] = prompt_messages
 
@@ -225,13 +225,13 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[device] using: {device}")
 
-    # 读数据
+    # load data
     data = load_jsonl_dataset(args.jsonl)
     if args.num_samples > 0:
         data = data[:args.num_samples]
     print(f"[info] num_samples to process = {len(data)}")
 
-    # 只加载一个模型（比如 RL checkpoint）
+    # only load one model (such as RL checkpoint)
     model, tokenizer, _ = load_model_and_tokenizer(
         args.ckpt_dir,
         max_seq_length=args.max_seq_length,
