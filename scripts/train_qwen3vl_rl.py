@@ -76,7 +76,7 @@ def load_jsonl_dataset(jsonl_path: str):
             try:
                 obj = json.loads(line)
             except Exception as e:
-                print(f"[warn] 解析 {jsonl_path} 第 {n_total} 行失败, 跳过: {e}")
+                print(f"[warn] analyze {jsonl_path} fail at row {n_total}, skip: {e}")
                 n_bad += 1
                 continue
             data.append(obj)
