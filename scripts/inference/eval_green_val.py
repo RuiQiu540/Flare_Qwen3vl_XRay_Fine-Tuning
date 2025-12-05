@@ -9,7 +9,7 @@ from PIL import Image
 import torch
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
-import metrics  # QWen2.5VL 的 metrics.py
+import metrics
 
 # config
 CKPT_DIR = "Qwen/Qwen3-VL-4B-Instruct"
@@ -138,7 +138,7 @@ def main():
 
     print("[info] Computing metrics on validation set...")
 
-    # 使用 Qwen2.5 的 GREEN + BLEU + clinical efficacy
+    # use Qwen2.5 GREEN + BLEU + clinical efficacy
     green_results = metrics.calculate_green_score(preds, refs)
     bleu = metrics.calculate_bleu_score(preds, refs)
     ce = metrics.calculate_clinical_efficacy_score(preds, refs)
